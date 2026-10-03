@@ -20,7 +20,18 @@ const modes = [
   "wrong-token-post-read-error", "wrong-token-post-read-empty",
   "bare-shell-post-read-error", "bare-shell-post-read-empty",
   "bare-shell-second-process-unavailable", "bare-shell-first-process-unavailable",
+  "launcher-shim", "launcher-shim-mixed-token", "launcher-shim-siblings",
+  "launcher-shim-match", "launcher-shim-match-after", "launcher-shim-child-differs",
+  "launcher-shim-child-differs-after", "launcher-shim-child-unparsed",
 ];
+// The real process behind a spawning shim carries its own argv.
+const shimChild: Record<string, string> = {
+  "launcher-shim-match": `--settings /shim/settings.json --session-id ${token}`,
+  "launcher-shim-match-after": `--session-id ${token} --settings /shim/settings.json`,
+  "launcher-shim-child-differs": "--settings /shim/settings.json --session-id different",
+  "launcher-shim-child-differs-after": "--session-id different --settings /shim/settings.json",
+  "launcher-shim-child-unparsed": "--settings /shim/settings.json --unrecognised-flag",
+};
 
 it.each(modes)("selector and ordinary transport: %s", async (mode) => {
   const db = createFullTestDb();
@@ -54,6 +65,14 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
         command: mode === "bare-shell-helper" ? "/fixture/gitstatusd" : "sleep 600", startedAt });
     }
     if (mode === "ambiguous-process") rows.push({ ...rows[2]!, pid: 103 });
+    // A launcher shim spawns (not execs) the real binary: one chain of three claude processes.
+    if (mode.startsWith("launcher-shim")) {
+      rows.push(
+        { ...rows[2]!, pid: 104, ppid: 102,
+          command: `/shim/bin/claude --permission-mode auto --session-id ${mode === "launcher-shim-mixed-token" ? "different" : token} --name ${name}` },
+        { ...rows[2]!, pid: 105, ppid: mode === "launcher-shim-siblings" ? 102 : 104, command: `/shim/claude ${shimChild[mode] ?? "--settings /shim/settings.json"} --permission-mode auto` },
+      );
+    }
     let reads = 0;
     const listProcesses = async () => {
       if (["unavailable", "unknown-both"].includes(mode)) throw new Error("fixture unavailable");
@@ -98,7 +117,8 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
     const expectedSend = [
       "npm-name", "versioned", "pane-command-unavailable", "unknown-both", "versioned-direct-pane",
       "missing-token", "unavailable", "background", "other-semver", "missing-metadata",
-      "versioned-argv-only", "versioned-comm-only",
+      "versioned-argv-only", "versioned-comm-only", "launcher-shim",
+      "launcher-shim-match", "launcher-shim-match-after", "launcher-shim-child-unparsed",
     ].includes(mode);
     if (bare) expect({ ok: sent.ok, calls }).toEqual({ ok: false, calls: [] });
     expect(sent.ok).toBe(expectedSend);
@@ -108,9 +128,15 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
       "npm-name", "versioned", "pane-command-unavailable", "versioned-direct-pane", "missing-metadata",
       "ambiguous-pane", "changed-binding", "onboarding", "changed-after-paste",
     ].includes(mode));
-    if (expectedSend && ["unavailable", "unknown-both", "missing-token", "missing-metadata", "background", "other-semver", "versioned-argv-only", "versioned-comm-only"].includes(mode)) {
+    if (expectedSend && ["unavailable", "unknown-both", "missing-token", "missing-metadata", "background", "other-semver", "versioned-argv-only", "versioned-comm-only", "launcher-shim", "launcher-shim-child-unparsed"].includes(mode)) {
       expect(sent.warning).toContain("without verified native identity");
     }
+    // A shim's token is not inherited: only the real process's own argv verifies.
+    if (mode.startsWith("launcher-shim-match")) expect(sent.warning ?? "").not.toContain("without verified native identity");
+    if (mode.startsWith("launcher-shim-child-differs")) expect(sent.error).toContain("name different conversations");
+    if (mode === "launcher-shim-mixed-token") expect(sent.error).toContain("name different conversations");
+    // Two children of one shim are two runtimes, not a chain.
+    if (mode === "launcher-shim-siblings") expect(sent.error).toContain("Multiple Claude processes");
     reads = 0; paneReads = 0;
     const queue = new QueueRepository(db, eventBus, { transport, loadHumanRegistry: () => ({ ok: true, entities: [] }) });
     // Exercise the actual wake consumer without an API, scheduler, or native process.
